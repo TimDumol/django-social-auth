@@ -10,3 +10,5 @@ env/
 doc/_build
 example/templates/script*.html
 contrib/tests/test_settings.py
+*#
+.\#*

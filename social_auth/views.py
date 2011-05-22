@@ -99,7 +99,7 @@ def auth_process(request, backend, complete_url_name):
     # Check and sanitize a user-defined GET/POST redirect_to field value.
     redirect = sanitize_redirect(request.get_host(),
                                  request.REQUEST.get(REDIRECT_FIELD_NAME))
-    request.session[REDIRECT_FIELD_NAME] = redirect or DEFAULT_REDIRECT
+    #request.session[REDIRECT_FIELD_NAME] = redirect or DEFAULT_REDIRECT
     if backend.uses_redirect:
         return HttpResponseRedirect(backend.auth_url())
     else:
