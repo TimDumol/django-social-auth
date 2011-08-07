@@ -77,6 +77,7 @@ FORCE_RANDOM_USERNAME = _setting('SOCIAL_AUTH_FORCE_RANDOM_USERNAME', False)
 USERNAME_FIXER = _setting('SOCIAL_AUTH_USERNAME_FIXER', lambda u: u)
 DEFAULT_USERNAME = _setting('SOCIAL_AUTH_DEFAULT_USERNAME')
 CHANGE_SIGNAL_ONLY = _setting('SOCIAL_AUTH_CHANGE_SIGNAL_ONLY', False)
+UUID_LENGHT = _setting('SOCIAL_AUTH_UUID_LENGTH', 16)
 
 
 class SocialAuthBackend(ModelBackend):
@@ -102,12 +103,11 @@ class SocialAuthBackend(ModelBackend):
         details = self.get_user_details(response)
         uid = self.get_user_id(details, response)
         is_new = False
+        user = kwargs.get('user')
+
         try:
-            social_user = UserSocialAuth.objects.select_related('user')\
-                                                .get(provider=self.name,
-                                                     uid=uid)
+            social_user = self.get_social_auth_user(uid)
         except UserSocialAuth.DoesNotExist:
-            user = kwargs.get('user')
             if user is None:  # new user
                 if not CREATE_USERS:
                     return None
@@ -135,12 +135,12 @@ class SocialAuthBackend(ModelBackend):
             # at this moment, merging account is not an option because that
             # would imply update user references on other apps, that's too
             # much intrusive
-            if 'user' in kwargs and kwargs['user'] != social_user.user:
+            if user and user != social_user.user:
                 raise ValueError('Account already in use.', social_user)
             user = social_user.user
 
-        # Update user account data.
-        self.update_user_details(user, response, details, is_new)
+        # Flag user "new" status
+        setattr(user, 'is_new', is_new)
 
         # Update extra_data storage, unless disabled by setting
         if LOAD_EXTRA_DATA:
@@ -149,6 +149,10 @@ class SocialAuthBackend(ModelBackend):
                 social_user.extra_data = extra_data
                 social_user.save()
 
+        user.social_user = social_user
+
+        # Update user account data.
+        self.update_user_details(user, response, details, is_new)
         return user
 
     def username(self, details):
@@ -156,44 +160,37 @@ class SocialAuthBackend(ModelBackend):
         setting is True, then username will be a random USERNAME_MAX_LENGTH
         chars uuid generated hash
         """
-        def get_random_username():
-            """Return hash from unique string cut at username max length"""
-            return uuid4().get_hex()[:USERNAME_MAX_LENGTH]
+        def mk_uuid():
+            """Return hash from unique string"""
+            return uuid4().get_hex()
 
         if FORCE_RANDOM_USERNAME:
-            username = get_random_username()
-        elif USERNAME in details:
+            username = mk_uuid()
+        elif details.get(USERNAME):
             username = details[USERNAME]
         elif DEFAULT_USERNAME:
             username = DEFAULT_USERNAME
             if callable(username):
                 username = username()
         else:
-            username = None
-        username = username or get_random_username()
+            username = mk_uuid()
 
-        name = username
+        short_username = username[:USERNAME_MAX_LENGTH - UUID_LENGHT]
         final_username = None
 
-        while not final_username:
+        while True:
+            final_username = USERNAME_FIXER(username)[:USERNAME_MAX_LENGTH]
+
             try:
-                fixed_name = USERNAME_FIXER(name)
-                User.objects.get(username=fixed_name)
+                User.objects.get(username=final_username)
             except User.DoesNotExist:
-                final_username = fixed_name
+                break
             else:
                 # User with same username already exists, generate a unique
                 # username for current user using username as base but adding
-                # a unique hash at the end.
-                #
-                # Generate an uuid number but keep only the needed to avoid
-                # breaking the field max_length value, this reduces the
-                # uniqueness, but it's less likely to happen repetitions than
-                # increasing an index.
-                uuid_length = getattr(settings, 'SOCIAL_AUTH_UUID_LENGTH', 16)
-                if len(username) + uuid_length > USERNAME_MAX_LENGTH:
-                    username = username[:USERNAME_MAX_LENGTH - uuid_length]
-                name = username + uuid4().get_hex()[:uuid_length]
+                # a unique hash at the end. Original username is cut to avoid
+                # the field max_length.
+                username = short_username + mk_uuid()[:UUID_LENGHT]
 
         return final_username
 
@@ -244,6 +241,15 @@ class SocialAuthBackend(ModelBackend):
 
         if changed:
             user.save()
+
+    def get_social_auth_user(self, uid):
+        """Return social auth user instance for given uid for current
+        backend.
+
+        Riase DoesNotExist exception if no entry.
+        """
+        return UserSocialAuth.objects.select_related('user')\
+                                     .get(provider=self.name, uid=uid)
 
     def get_user_id(self, details, response):
         """Must return a unique ID from values returned on details"""
@@ -299,6 +305,15 @@ class OAuthBackend(SocialAuthBackend):
 class OpenIDBackend(SocialAuthBackend):
     """Generic OpenID authentication backend"""
     name = 'openid'
+
+    def get_social_auth_user(self, uid):
+        """Return social auth user instance for given uid. OpenId uses
+        identity_url to identify the user in a unique way and that value
+        identifies the provider too.
+
+        Riase DoesNotExist exception if no entry.
+        """
+        return UserSocialAuth.objects.select_related('user').get(uid=uid)
 
     def get_user_id(self, details, response):
         """Return user unique id provided by service"""
@@ -414,11 +429,14 @@ class BaseAuth(object):
         """Return backend enabled status, all enabled by default"""
         return True
 
-    def disconnect(self, user):
+    def disconnect(self, user, association_id=None):
         """Deletes current backend from user if associated.
         Override if extra operations are needed.
         """
-        user.social_auth.filter(provider=self.AUTH_BACKEND.name).delete()
+        if association_id:
+            user.social_auth.get(id=association_id).delete()
+        else:
+            user.social_auth.filter(provider=self.AUTH_BACKEND.name).delete()
 
 
 class OpenIdAuth(BaseAuth):
